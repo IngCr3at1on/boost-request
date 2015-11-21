@@ -1,0 +1,15 @@
+#
+# normal rules
+#
+.*
+
+
+#
+# git files that we don't want to ignore even if they are dot-files
+#
+!.gitignore
+
+#
+# project files and an out of source build dir
+#
+build/
