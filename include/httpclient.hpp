@@ -4,9 +4,7 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/bind.hpp>
-#include <boost/iostreams/concepts.hpp>
 #include <boost/iostreams/stream.hpp>
-#include <boost/iostreams/write.hpp>
 
 #include <json_spirit/json_spirit.h>
 
