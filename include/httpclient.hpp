@@ -4,11 +4,14 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/bind.hpp>
+#include <boost/iostreams/concepts.hpp>
+#include <boost/iostreams/stream.hpp>
+#include <boost/iostreams/write.hpp>
 
 #include <json_spirit/json_spirit.h>
 
 namespace {
-    typedef boost::asio::ssl::stream<boost::asio::ip::tcp::socket> ssl_socket;
+    typedef boost::asio::ssl::stream<boost::asio::ip::tcp::socket> SSLStream;
 
     bool valid_status(unsigned int status_code, std::string headers, bool printheaders = false) {
         switch(status_code) {
@@ -39,16 +42,15 @@ namespace {
     }
 } // namespace
 
-class HTTPClient {
+class SSLIOStreamDevice : public boost::iostreams::device<boost::iostreams::bidirectional> {
     public:
-        HTTPClient(boost::asio::io_service &io_service,
-                    boost::asio::ip::tcp::resolver::iterator endpoint_iterator)
-                  : socket_(io_service)
-                  {
-                      boost::asio::connect(socket_, endpoint_iterator);
-                  }
+        SSLIOStreamDevice(SSLStream &streamIn, bool fUseSSLIn) : stream(streamIn) {
+            fUseSSL = fUseSSLIn;
+            fNeedHandshake = fUseSSLIn;
+        }
 
-        bool HandleRequest(boost::asio::ip::tcp::resolver::query /*query*/, std::string /*request*/, std::string &/*headers*/, bool /*printheaders*/);
+        bool HandleRequest(const std::string /*server*/, const std::string /*port*/, const std::string request, std::string &/*headers*/, bool printheaders = false);
+
         /** Read the contents of the buffer into a string. */
         void ReadToString(std::string &/*strBuffer*/);
         /** Read the contents of the buffer into a JSON object. */
@@ -61,44 +63,74 @@ class HTTPClient {
             return false;
         }
 
-    protected:
-        boost::asio::streambuf sb_;
+    private:
+        void handshake(boost::asio::ssl::stream_base::handshake_type role) {
+            if (!fNeedHandshake) return;
+            fNeedHandshake = false;
+            stream.handshake(role);
+        }
+
+        std::size_t read_all(boost::system::error_code &ec) {
+            handshake(boost::asio::ssl::stream_base::server); // HTTPS servers read first
+            if (fUseSSL)
+                return boost::asio::read(stream, sb_, boost::asio::transfer_at_least(1), ec);
+
+            return boost::asio::read(stream.next_layer(), sb_, boost::asio::transfer_at_least(1), ec);
+        }
+
+        std::size_t read_until(std::string delimeter, boost::system::error_code &ec) {
+            handshake(boost::asio::ssl::stream_base::server); // HTTPS servers read first
+            if (fUseSSL)
+                return boost::asio::read_until(stream, sb_, delimeter, ec);
+
+            return boost::asio::read_until(stream.next_layer(), sb_, delimeter, ec);
+        }
+
+        std::size_t write(boost::system::error_code &ec) {
+            handshake(boost::asio::ssl::stream_base::client); // HTTPS clients write first
+            if (fUseSSL)
+                return boost::asio::write(stream, sb_, ec);
+
+            return boost::asio::write(stream.next_layer(), sb_, ec);
+        }
+
+        bool connect(const std::string& server, const std::string& port) {
+            boost::asio::ip::tcp::resolver resolver(stream.get_io_service());
+            boost::asio::ip::tcp::resolver::query query(server.c_str(), port.c_str());
+            boost::asio::ip::tcp::resolver::iterator endpoint_iterator = resolver.resolve(query);
+            boost::asio::ip::tcp::resolver::iterator end;
+
+            if (fUseSSL) {
+                certificate_name.clear(); // Initialize for good measure.
+                stream.set_verify_mode(boost::asio::ssl::verify_peer);
+                stream.set_verify_callback(boost::bind(&SSLIOStreamDevice::verify_certificate, this, _1, _2));
+            }
+
+            boost::system::error_code ec = boost::asio::error::host_not_found;
+            while (ec && endpoint_iterator != end) {
+                stream.lowest_layer().close();
+                stream.lowest_layer().connect(*endpoint_iterator++, ec);
+            }
+            if (ec)
+                return false;
+
+            return true;
+        }
 
         bool getHTTPVersion(std::string &/*headers*/, unsigned int &/*status_code*/);
         void extract_headers(std::string &/*headers*/);
-
-    private:
-        boost::asio::ip::tcp::socket socket_;
-};
-
-class HTTPClientSecure : public HTTPClient {
-    public:
-        HTTPClientSecure(boost::asio::io_service &io_service,
-                          boost::asio::ssl::context &context,
-                          boost::asio::ip::tcp::resolver::iterator endpoint_iterator,
-                          std::string request)
-                        : HTTPClient(io_service, endpoint_iterator),
-                          socket_(io_service, context)
-                        {
-                            certificate_name.clear(); // Initialize for good measure.
-                            socket_.set_verify_mode(boost::asio::ssl::verify_peer);
-                            socket_.set_verify_callback(boost::bind(&HTTPClientSecure::verify_certificate, this, _1, _2));
-                            boost::asio::connect(socket_.lowest_layer(), endpoint_iterator);
-                            socket_.handshake(ssl_socket::client);
-                        }
-        /* Overwrite HandleRequest to use the ssl_socket on socket calls instead
-         * of a standard socket. */
-        bool HandleRequest(boost::asio::ip::tcp::resolver::query /*query*/, std::string /*request*/, std::string &/*headers*/, bool /*printheaders*/);
-
-    private:
-        ssl_socket socket_;
-        std::string certificate_name;
         bool verify_certificate(bool /*preverified*/, boost::asio::ssl::verify_context &/*ctx*/);
+
+        bool fNeedHandshake;
+        bool fUseSSL;
+        SSLStream& stream;
+        boost::asio::streambuf sb_;
+        std::string certificate_name;
 };
 
 /* Grab the html version and status code from our buffer object and append them
  * to a header string. */
-bool HTTPClient::getHTTPVersion(std::string &headers, unsigned int &status_code) {
+bool SSLIOStreamDevice::getHTTPVersion(std::string &headers, unsigned int &status_code) {
     std::string html_version;
     std::istream is(&sb_);
 
@@ -117,7 +149,7 @@ bool HTTPClient::getHTTPVersion(std::string &headers, unsigned int &status_code)
     return true;
 }
 
-void HTTPClient::extract_headers(std::string &headers) {
+void SSLIOStreamDevice::extract_headers(std::string &headers) {
     std::istream is(&sb_);
     std::string header;
     unsigned int i = 0;
@@ -130,20 +162,26 @@ void HTTPClient::extract_headers(std::string &headers) {
     }
 }
 
-bool HTTPClient::HandleRequest(boost::asio::ip::tcp::resolver::query query, std::string request, std::string &headers, bool printheaders) {
+bool SSLIOStreamDevice::HandleRequest(const std::string server, const std::string port, const std::string request, std::string &headers, bool printheaders) {
+    if (!connect(server, port)) {
+        printf("SSLIOStreamDevice::HandleRequest : error connecting to server %s on port %s\n", server.c_str(), port.c_str());
+        return false;
+    }
+
     std::ostream os(&sb_);
     os << request;
 
     boost::system::error_code ec;
-    boost::asio::write(socket_, sb_, ec);
-    if (ec != boost::system::errc::success) {
-        printf("HTTPClient::HandleRequest : error writing to request stream %s\n", ec.message().c_str());
+    size_t sz;
+    sz = write(ec);
+    if (ec != boost::system::errc::success || sz <= 0) {
+        printf("SSLIOStreamDevice::HandleRequest : error writing to request stream %s\n", ec.message().c_str());
         return false;
     }
 
-    boost::asio::read_until(socket_, sb_, "\r\n", ec);
-    if (ec != boost::system::errc::success) {
-        printf("HTTPClient::HandleRequest : error reading response %s\n", ec.message().c_str());
+    sz = read_until("\r\n", ec);
+    if (ec != boost::system::errc::success || sz <= 0) {
+        printf("SSLIOStreamDevice::HandleRequest : error reading response %s\n", ec.message().c_str());
         return false;
     }
 
@@ -151,10 +189,11 @@ bool HTTPClient::HandleRequest(boost::asio::ip::tcp::resolver::query query, std:
     if (!getHTTPVersion(headers, status_code))
         return false;
 
-    // Read body til EOF
-    while (boost::asio::read(socket_, sb_, boost::asio::transfer_at_least(1), ec));
+    /* Read body til EOF (runs in a loop because it may return success with more
+     * pending) */
+    while (read_all(ec));
     if (ec != boost::asio::error::eof) {
-        printf("HTTPClient::HandleRequest : error reading body %s\n", ec.message().c_str());
+        printf("SSLIOStreamDevice::HandleRequest : error reading body %s\n", ec.message().c_str());
         return false;
     }
 
@@ -171,7 +210,7 @@ bool HTTPClient::HandleRequest(boost::asio::ip::tcp::resolver::query query, std:
 
 /* If we have -printheaders defined go ahead and print certificate names on
  * secure connections, otherwise just return default verification. */
-bool HTTPClientSecure::verify_certificate(bool preverified, boost::asio::ssl::verify_context& ctx) {
+bool SSLIOStreamDevice::verify_certificate(bool preverified, boost::asio::ssl::verify_context& ctx) {
     char subject_name[256];
     X509* cert = X509_STORE_CTX_get_current_cert(ctx.native_handle());
     X509_NAME_oneline(X509_get_subject_name(cert), subject_name, 256);
@@ -181,49 +220,7 @@ bool HTTPClientSecure::verify_certificate(bool preverified, boost::asio::ssl::ve
     return preverified;
 }
 
-bool HTTPClientSecure::HandleRequest(boost::asio::ip::tcp::resolver::query query, std::string request, std::string &headers, bool printheaders) {
-    std::ostream os(&sb_);
-    os << request;
-
-    if (printheaders)
-        printf("%s\n", certificate_name.c_str());
-
-    boost::system::error_code ec;
-    boost::asio::write(socket_, sb_, ec);
-    if (ec != boost::system::errc::success) {
-        printf("HTTPClientSecure::HandleRequest : error writing to request stream %s\n", ec.message().c_str());
-        return false;
-    }
-
-    boost::asio::read_until(socket_, sb_, "\r\n", ec);
-    if (ec != boost::system::errc::success) {
-        printf("HTTPClientSecure::HandleRequest : error reading response %s\n", ec.message().c_str());
-        return false;
-    }
-
-    unsigned int status_code = 0;
-    if (!getHTTPVersion(headers, status_code))
-        return false;
-
-    // Read body til EOF
-    while (boost::asio::read(socket_, sb_, boost::asio::transfer_at_least(1), ec));
-    if (ec != boost::asio::error::eof) {
-        printf("HTTPClientSecure::HandleRequest : error reading body %s\n", ec.message().c_str());
-        return false;
-    }
-
-    extract_headers(headers);
-
-    if (!valid_status(status_code, headers, printheaders))
-        return false;
-
-    if (printheaders)
-        printf("%s\n", headers.c_str());
-
-    return true;
-}
-
-void HTTPClient::ReadToString(std::string &strBuffer) {
+void SSLIOStreamDevice::ReadToString(std::string &strBuffer) {
     std::istream is(&sb_);
     std::string strLine;
     unsigned int i = 0;
@@ -236,7 +233,7 @@ void HTTPClient::ReadToString(std::string &strBuffer) {
     }
 }
 
-bool HTTPClient::ReadToJSON(json_spirit::Object &obj) {
+bool SSLIOStreamDevice::ReadToJSON(json_spirit::Object &obj) {
     std::istream is(&sb_);
     json_spirit::Value val;
     if (json_spirit::read(is, val)) {
