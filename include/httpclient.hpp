@@ -12,27 +12,25 @@ namespace {
     typedef boost::asio::ssl::stream<boost::asio::ip::tcp::socket> SSLStream;
 
     bool valid_status(unsigned int status_code, std::string headers, bool printheaders = false) {
+        if (printheaders && status_code != 200) {
+            printf("%s\n", headers.c_str());
+            return false;
+        }
+
         switch(status_code) {
             case 200:
                 break;
-            case 201:
-                if (printheaders)
-                    printf("%s\n", headers.c_str());
-                /* Do not break or return allowing the printheaders to work on
-                 * all cases over 200 */
             case 301:
-                if (!printheaders)
-                    printf("getstatus : response returned with status code 301 : moved permanently\n");
+                printf("getstatus : response returned with status code 301 : moved permanently\n");
+                return false;
+            case 400:
+                printf("getstatus : response returned with status code 400 : bad request\n");
                 return false;
             case 403:
-                if (!printheaders)
-                    printf("getstatus : response returned with status code 403 : forbidden\n");
+                printf("getstatus : response returned with status code 403 : forbidden\n");
                 return false;
             default:
-                if (printheaders && status_code < 200)
-                    printf("%s\n", headers.c_str());
-                if (!printheaders)
-                    printf("getstatus : response returned with status code %d\n", status_code);
+                printf("getstatus : response returned with status code %d\n", status_code);
                 return false;
         }
 
